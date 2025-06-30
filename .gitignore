@@ -1,0 +1,9 @@
+.venv-windows
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info
+dist  

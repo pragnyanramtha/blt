@@ -1,0 +1,5 @@
+spacy==3.7.2
+networkx==3.2.1
+numpy==1.26.2
+requests==2.31.0
+tqdm==4.66.1
