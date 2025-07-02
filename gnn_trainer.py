@@ -1,145 +1,131 @@
-# gnn_trainer.py
+# gnn_trainer.py (Improved Version for Stable Training)
+
 import pickle
 import os
-import argparse
-import random
+import torch
+import spacy
+import networkx as nx
 import numpy as np
 from tqdm import tqdm
+import random
 
-import torch
-import torch.nn.functional as F
-from torch.nn import Linear
-from torch_geometric.nn import SAGEConv
-from torch_geometric.data import Data, DataLoader
-
-import spacy
 from node2vec import Node2Vec
+from torch_geometric.nn import GCNConv
+import torch.nn.functional as F
 
-# --- 1. The GNN Model Definition ---
-class EdgeClassifierGNN(torch.nn.Module):
+# --- 1. GNN Model Definition ---
+# A more powerful architecture with dedicated projection heads
+class GNNEdgeClassifier(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
         super().__init__()
-        self.conv1 = SAGEConv(in_channels, hidden_channels)
-        self.conv2 = SAGEConv(hidden_channels, hidden_channels)
-        self.classifier = Linear(2 * hidden_channels, out_channels)
+        # GCN layers to learn node representations based on graph structure
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        
+        # --- NEW: Add projection heads ---
+        # These linear layers will process the GCN output, which often improves performance.
+        self.source_proj = torch.nn.Linear(out_channels, out_channels)
+        self.dest_proj = torch.nn.Linear(out_channels, out_channels)
 
     def forward(self, x, edge_index):
-        # Get contextualized node embeddings
-        h = self.conv1(x, edge_index).relu()
-        h = self.conv2(h, edge_index).relu()
+        # Pass data through GCN layers
+        x = self.conv1(x, edge_index).relu()
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv2(x, edge_index)
+        return x
+
+# --- 2. Main Training Logic ---
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    print("Loading base KG from 'output/war_and_peace_kg.pkl'...")
+    with open('output/war_and_peace_kg.pkl', 'rb') as f:
+        data = pickle.load(f)
+    graph = data['graph']
+    nodes = list(graph.nodes())
+    node_to_idx = {node: i for i, node in enumerate(nodes)}
+    
+    print("Step 1: Creating combined node features...")
+    # (The feature creation part is the same)
+    nlp = spacy.load("en_core_web_lg")
+    spacy_embeds = np.array([nlp(node).vector for node in tqdm(nodes, desc="SpaCy Embeddings")])
+    node2vec = Node2Vec(graph, dimensions=64, walk_length=30, num_walks=200, workers=4)
+    n2v_model = node2vec.fit(window=10, min_count=1, batch_words=4)
+    node2vec_embeds = np.array([n2v_model.wv[node] for node in nodes])
+    combined_features = np.concatenate([spacy_embeds, node2vec_embeds], axis=1)
+    features_tensor = torch.tensor(combined_features, dtype=torch.float).to(device)
+    print(f"Combined feature matrix created with shape: {features_tensor.shape}")
+
+    print("Step 2: Creating labeled dataset of edges...")
+    # (The dataset creation part is the same)
+    positive_edges = [(node_to_idx[u], node_to_idx[v]) for u, v, data in graph.edges(data=True) if data.get('sentence_id') is not None]
+    negative_edges = []
+    all_nodes_set = set(nodes)
+    while len(negative_edges) < len(positive_edges):
+        u_node, v_node = random.sample(list(all_nodes_set), 2)
+        if not graph.has_edge(u_node, v_node):
+            negative_edges.append((node_to_idx[u_node], node_to_idx[v_node]))
+    
+    edge_index_list = positive_edges + negative_edges
+    labels_list = [1] * len(positive_edges) + [0] * len(negative_edges)
+    
+    # Shuffle the dataset for better training
+    shuffled_data = list(zip(edge_index_list, labels_list))
+    random.shuffle(shuffled_data)
+    edge_index_list, labels_list = zip(*shuffled_data)
+    
+    labeled_edges = torch.tensor(list(zip(*edge_index_list)), dtype=torch.long).to(device)
+    labels = torch.tensor(labels_list, dtype=torch.float).to(device)
+    
+    # We need a separate edge_index for message passing that contains ALL graph edges
+    all_graph_edges = torch.tensor(list(zip(*[(node_to_idx[u], node_to_idx[v]) for u, v in graph.edges()])), dtype=torch.long).to(device)
+
+    print("Step 3: Training the GNN Edge Classifier...")
+    model = GNNEdgeClassifier(in_channels=features_tensor.shape[1], hidden_channels=256, out_channels=128).to(device)
+    
+    # --- NEW: Lower learning rate for stability ---
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
+    criterion = torch.nn.BCEWithLogitsLoss()
+
+    for epoch in range(100): # Train for more epochs with a lower learning rate
+        model.train()
+        optimizer.zero_grad()
         
-        # The classifier operates on pairs of nodes
-        def classify(edge_list):
-            src, dst = edge_list[0], edge_list[1]
-            edge_features = torch.cat([h[src], h[dst]], dim=-1)
-            return self.classifier(edge_features)
-            
-        return classify
-
-# --- 2. Main Training Orchestrator ---
-class GNNTrainer:
-    def __init__(self, graph, sentence_map):
-        self.graph = graph
-        self.sentence_map = sentence_map
-        self.nodes = list(graph.nodes())
-        self.node_to_idx = {node: i for i, node in enumerate(self.nodes)}
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {self.device}")
-
-    def create_features(self):
-        print("Step 1: Creating combined node features (Semantic + Structural)...")
-        # a) Semantic features (spaCy)
-        print("  - Generating spaCy embeddings...")
-        nlp = spacy.load("en_core_web_lg")
-        spacy_embeds = np.array([nlp(node).vector for node in tqdm(self.nodes)])
-
-        # b) Structural features (Node2Vec)
-        print("  - Generating Node2Vec embeddings...")
-        node2vec = Node2Vec(self.graph, dimensions=64, walk_length=30, num_walks=200, workers=4)
-        n2v_model = node2vec.fit(window=10, min_count=1, batch_words=4)
-        n2v_embeds = np.array([n2v_model.wv[node] for node in self.nodes])
+        # Get node embeddings from the GCN layers
+        node_embeds = model(features_tensor, all_graph_edges)
         
-        # c) Combine features
-        self.features = np.concatenate([spacy_embeds, n2v_embeds], axis=1)
-        self.n2v_model = n2v_model
-        print(f"Combined feature matrix created with shape: {self.features.shape}")
-
-    def create_labeled_dataset(self):
-        print("Step 2: Creating labeled dataset of edges...")
-        # Positive samples (all existing edges are within-sentence)
-        positive_edges = []
-        for u, v in self.graph.edges():
-            positive_edges.append([self.node_to_idx[u], self.node_to_idx[v]])
+        # Get embeddings for the specific edges we have labels for
+        source_indices = labeled_edges[0]
+        dest_indices = labeled_edges[1]
         
-        # Negative samples (random edges between nodes from different sentences)
-        negative_edges = []
-        sentence_nodes_list = list(self.sentence_map.values())
-        num_neg_samples = len(positive_edges) * 2 # Create 2x negative samples
+        source_embeds = node_embeds[source_indices]
+        dest_embeds = node_embeds[dest_indices]
         
-        print(f"  - Generating {num_neg_samples} negative samples...")
-        with tqdm(total=num_neg_samples) as pbar:
-            while len(negative_edges) < num_neg_samples:
-                s1_nodes, s2_nodes = random.sample(sentence_nodes_list, 2)
-                if not s1_nodes or not s2_nodes: continue
-                u, v = random.choice(list(s1_nodes)), random.choice(list(s2_nodes))
-                if u in self.node_to_idx and v in self.node_to_idx:
-                    negative_edges.append([self.node_to_idx[u], self.node_to_idx[v]])
-                    pbar.update(1)
-
-        # Create labels (0 for positive, 1 for negative/boundary)
-        pos_labels = torch.zeros(len(positive_edges))
-        neg_labels = torch.ones(len(negative_edges))
+        # --- NEW: Use the projection heads ---
+        source_embeds = model.source_proj(source_embeds)
+        dest_embeds = model.dest_proj(dest_embeds)
         
-        self.train_edges = torch.tensor(positive_edges + negative_edges).t().contiguous()
-        self.train_labels = torch.cat([pos_labels, neg_labels], dim=0).long()
-
-    def train(self, epochs=50):
-        print("Step 3: Training the GNN Edge Classifier...")
-        x = torch.tensor(self.features, dtype=torch.float).to(self.device)
-        edge_index = torch.tensor(list(zip(*[(self.node_to_idx[u], self.node_to_idx[v]) for u,v in self.graph.edges()]))).to(self.device)
+        # Dot product as a similarity score
+        preds = (source_embeds * dest_embeds).sum(dim=1)
         
-        model = EdgeClassifierGNN(self.features.shape[1], 128, 2).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        loss = criterion(preds, labels)
+        loss.backward()
+        optimizer.step()
+        
+        accuracy = ((preds > 0).float() == labels).float().mean()
+        if (epoch + 1) % 10 == 0:
+            print(f'Epoch: {epoch+1:02d}, Loss: {loss:.4f}, Accuracy: {accuracy*100:.2f}%')
 
-        for epoch in range(1, epochs + 1):
-            model.train()
-            optimizer.zero_grad()
-            classifier = model(x, edge_index)
-            # Get predictions for our labeled edges
-            preds = classifier(self.train_edges.to(self.device))
-            loss = F.cross_entropy(preds, self.train_labels.to(self.device))
-            loss.backward()
-            optimizer.step()
-            
-            # Simple accuracy check
-            acc = ((preds.argmax(dim=-1) == self.train_labels.to(self.device)).sum() / len(self.train_labels)) * 100
-            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Accuracy: {acc:.2f}%')
-            
-        self.model = model
-
-    def save_models(self, path="output"):
-        print(f"Step 4: Saving trained models to '{path}'...")
-        os.makedirs(path, exist_ok=True)
-        torch.save(self.model.state_dict(), os.path.join(path, "gnn_model.pth"))
-        self.n2v_model.save(os.path.join(path, "node2vec.model"))
-        # Save the node mapping, it's crucial for inference
-        with open(os.path.join(path, "node_mapping.pkl"), "wb") as f:
-            pickle.dump({"nodes": self.nodes, "features": self.features}, f)
-        print("Models saved successfully.")
-
+    print("Step 4: Saving trained models and features to 'output'...")
+    output_dir = 'output'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    torch.save(model.state_dict(), os.path.join(output_dir, 'gnn_model.pth'))
+    torch.save(features_tensor, os.path.join(output_dir, 'node_features.pt'))
+    torch.save(node_to_idx, os.path.join(output_dir, 'node_to_idx.pt'))
+    
+    print("Models and features saved successfully.")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train a GNN to detect sentence boundaries.")
-    parser.add_argument("--kg_file", type=str, default="output/war_and_peace_kg.pkl")
-    args, _ = parser.parse_known_args()
-
-    print(f"Loading base KG from '{args.kg_file}'...")
-    with open(args.kg_file, "rb") as f:
-        data = pickle.load(f)
-    graph, sentence_map = data["graph"], data["sentence_map"]
-
-    trainer = GNNTrainer(graph, sentence_map)
-    trainer.create_features()
-    trainer.create_labeled_dataset()
-    trainer.train(epochs=50) # You can adjust epochs
-    trainer.save_models()
+    main()
